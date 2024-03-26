@@ -1,0 +1,474 @@
+import math
+import torch
+from torch import nn
+from torch.nn.parameter import Parameter
+from models.rp.module import TrainingHook
+
+thresh, lens, decay = (0.5, 0.5, 0.2)
+
+class ActFun(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return input.gt(thresh).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        # temp = input > (thresh - lens) # new
+        temp = abs(input - thresh) < lens # old
+        return grad_input * temp.float()
+
+    # @staticmethod
+    # def backward(ctx, grad_h):
+    #     z = ctx.saved_tensors
+    #     s = torch.sigmoid(z[0])
+    #     d_input = (1 - s) * s * grad_h
+    #     return d_input
+
+act_fun = ActFun.apply
+
+def linearExcitability(input, weight, excitability=None, bias=None):
+    '''
+    Applies a linear transformation to the incoming data: :math:`y = c(xA^T) + b`.
+
+    Shape:
+        - input:        :math:`(N, *, in\_features)`
+        - weight:       :math:`(out\_features, in\_features)`
+        - excitability: :math:`(out\_features)`
+        - bias:         :math:`(out\_features)`
+        - output:       :math:`(N, *, out\_features)`
+    (NOTE: `*` means any number of additional dimensions)
+    '''
+
+    if type(input) == list:
+        spikes = 0
+        for i in range(len(input)):
+            spikes += input[i]
+        input = spikes / len(input)
+
+    if excitability is not None:
+        output = input.matmul(weight.t()) * excitability
+    else:
+        output = input.matmul(weight.t())
+    if bias is not None:
+        output += bias
+    return output
+
+class Mask(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, stdp_mask):
+        ctx.save_for_backward(stdp_mask)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        stdp_mask, = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        return grad_input * stdp_mask if stdp_mask is not None else grad_input, None
+
+mask = Mask.apply
+
+def integrate_stdp(stdp_list, mark):
+    '''integrate stdp matrix by label(list) or task(int) '''
+
+    if type(mark) is list:
+        max_label = max(mark)
+        if len(stdp_list) < (max_label + 1):
+            for i in range(max_label + 1 - len(stdp_list)):
+                stdp_list.append(torch.zeros_like(stdp_list[0]))
+
+        stdp = torch.zeros_like(stdp_list[0])
+        for i in range(len(stdp_list)):
+            if i not in mark:
+                stdp[stdp < stdp_list[i]] = stdp_list[i][stdp < stdp_list[i]]
+    else:
+        if len(stdp_list) < (mark + 1):
+            for i in range(mark + 1 - len(stdp_list)):
+                stdp_list.append(torch.zeros_like(stdp_list[0]))
+
+        stdp = torch.zeros_like(stdp_list[0])
+        for i in range(len(stdp_list)):
+            if i != mark:
+                stdp[stdp < stdp_list[i]] = stdp_list[i][stdp < stdp_list[i]]
+
+    return stdp
+
+def spikinglinearExcitability(input, weight, excitability=None, bias=None, stdp_mask=None):
+    '''
+    Applies a linear transformation to the incoming data: :math:`y = c(xA^T) + b`.
+
+    Shape:
+        - input:        :math:`(N, *, in\_features)`
+        - weight:       :math:`(out\_features, in\_features)`
+        - excitability: :math:`(out\_features)`
+        - bias:         :math:`(out\_features)`
+        - output:       :math:`(N, *, out\_features)`
+    (NOTE: `*` means any number of additional dimensions)
+    '''
+
+    if type(input) == list:
+        spikes = 0
+        for i in range(len(input)):
+            spikes += input[i]
+        input = spikes / len(input)
+
+    stdp_masking = stdp_mask.detach() if stdp_mask is not None else stdp_mask
+    # n_weight = weight
+    n_weight = mask(weight, stdp_masking)
+    # n_weight = weight * stdp_masking if stdp_mask is not None else weight
+
+    if excitability is not None:
+        output = input.matmul(n_weight.t()) * excitability
+    else:
+        output = input.matmul(n_weight.t())
+    if bias is not None:
+        output += bias
+    return output
+
+class LinearExcitability(nn.Module):
+    '''Applies a linear transformation to the incoming data: :math:`y = c(Ax) + b`
+
+    Args:
+        in_features:    size of each input sample
+        out_features:   size of each output sample
+        bias:           if 'False', layer will not learn an additive bias-parameter (DEFAULT=True)
+        excitability:   if 'False', layer will not learn a multiplicative excitability-parameter (DEFAULT=True)
+
+    Shape:
+        - input:    :math:`(N, *, in\_features)` where `*` means any number of additional dimensions
+        - output:   :math:`(N, *, out\_features)` where all but the last dimension are the same shape as the input.
+
+    Attributes:
+        weight:         the learnable weights of the module of shape (out_features x in_features)
+        excitability:   the learnable multiplication terms (out_features)
+        bias:           the learnable bias of the module of shape (out_features)
+        excit_buffer:   fixed multiplication variable (out_features)
+
+    Examples::
+
+        >>> m = LinearExcitability(20, 30)
+        >>> input = autograd.Variable(torch.randn(128, 20))
+        >>> output = m(input)
+        >>> print(output.size())
+    '''
+
+    def __init__(self, in_features, out_features, bias=True, excitability=False, excit_buffer=False):
+        super(LinearExcitability, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.Tensor(out_features, in_features))
+        if excitability:
+            self.excitability = Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('excitability', None)
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        if excit_buffer:
+            buffer = torch.Tensor(out_features).uniform_(1,1)
+            self.register_buffer('excit_buffer', buffer)
+        else:
+            self.register_buffer('excit_buffer', None)
+        self.bias = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        '''Modifies the parameters 'in-place' to reset them at appropriate initialization values'''
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        nn.init.orthogonal_(self.weight)
+        if self.excitability is not None:
+            self.excitability.data.uniform_(1, 1)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input):
+        '''Running this model's forward step requires/returns:
+        INPUT: -[input]: [batch_size]x[...]x[in_features]
+        OUTPUT: -[output]: [batch_size]x[...]x[hidden_features]'''
+        if self.excit_buffer is None:
+            excitability = self.excitability
+        elif self.excitability is None:
+            excitability = self.excit_buffer
+        else:
+            excitability = self.excitability * self.excit_buffer
+        return linearExcitability(input, self.weight, excitability, self.bias)
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(' + 'in_features=' + str(self.in_features) + ', out_features=' + str(self.out_features) + ')'
+
+class SpikingLinearExcitability(nn.Module):
+    '''Applies a spiking version of linear transformation to the incoming data: :math:`y = c(Ax) + b`'''
+
+    def __init__(self, in_features, out_features, bias=True, excitability=False, excit_buffer=False, time_window=20, membrane_reserve=False, stdp_reserve=True):
+        super(SpikingLinearExcitability, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.last_layer = True if self.out_features == 10 else False
+        # self.last_layer = False
+        self.time_window = time_window
+        self.membrane_reserve = membrane_reserve
+        self.membrane_potential = None
+        self.stdp = None
+        self.stdp_reserve = stdp_reserve
+        self.stdp_his = None
+        self.alpha = 0.5 # stdp_list update
+        self.beta = 1 # nonlinear
+        self.sigma = 0.2
+
+        self.stdp_list = [torch.zeros((self.out_features, self.in_features)).cuda()]
+        # for _ in range(5):
+        #     self.stdp_list.append(torch.zeros((self.out_features, self.in_features)).cuda())
+
+        self.spike = None
+        self.weight = Parameter(torch.Tensor(out_features, in_features))
+        self.hook = TrainingHook(label_features=None, dim_hook=(10, out_features), train_mode='DRTP')
+        if excitability:
+            self.excitability = Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('excitability', None)
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        if excit_buffer:
+            buffer = torch.Tensor(out_features).uniform_(1,1)
+            self.register_buffer('excit_buffer', buffer)
+        else:
+            self.register_buffer('excit_buffer', None)
+        self.reset_parameters()
+        self.new_task = [0, 1, 2, 3, 4]
+
+    def reset_parameters(self):
+        '''Modifies the parameters 'in-place' to reset them at appropriate initialization values'''
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.excitability is not None:
+            self.excitability.data.uniform_(1, 1)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, labels, task=None):
+        '''Running this model's forward step requires/returns:
+        INPUT: -[input]: [batch_size]x[...]x[in_features]
+        OUTPUT: -[output]: [batch_size]x[...]x[hidden_features]'''
+
+        if type(input) == list:
+            batch_size = input[0].shape[0]
+        else:
+            batch_size = input.shape[0]
+
+        # labels = (labels.argmax(dim=1) if labels.shape.__len__() == 2 else labels.argmax().unsqueeze(0)) if labels is not None else None
+        min_label = int(labels.min().item()) if labels is not None else None
+        max_label = int(labels.max().item()) if labels is not None else None
+
+        sum_x = 0
+        sum_spike = 0
+        outputs = []
+        if self.membrane_reserve:
+            membrane_potential = self.membrane_potential
+        else:
+            membrane_potential = None
+
+        # if self.stdp_reserve:
+        #     stdp = self.stdp
+        #     stdp_his = self.stdp_his
+        #     stdp_new = self.stdp_his.detach() if self.stdp_his is not None else None
+        # else:
+        #     stdp = None
+        #     stdp_his = None
+
+        if self.excit_buffer is None:
+            excitability = self.excitability
+        elif self.excitability is None:
+            excitability = self.excit_buffer
+        else:
+            excitability = self.excitability * self.excit_buffer
+
+        with torch.no_grad():
+            if labels is not None:
+                stdp_mask_temp = integrate_stdp(self.stdp_list, task)
+                index = (self.stdp_list[int(min_label / 2)] - stdp_mask_temp) > 0.95
+
+                dividing = 0.01
+                if stdp_mask_temp[stdp_mask_temp > dividing].shape[0] > 0:
+                    stdp_mask_temp[stdp_mask_temp >= dividing] = 1
+                if stdp_mask_temp[stdp_mask_temp <= dividing].shape[0] > 0:
+                    stdp_mask_temp[stdp_mask_temp < dividing] = 0
+
+                if self.last_layer:
+                    stdp_ones = torch.ones_like(stdp_mask_temp)
+                    stdp_ones[min_label:(max_label + 1), :] = stdp_mask_temp[min_label:(max_label + 1), :]
+                    stdp_mask_temp = stdp_ones
+
+                # if index.sum() != 0:
+                #     stdp_mask_temp[index] = 0
+
+                stdp_mask = 1 - stdp_mask_temp
+            else:
+                stdp_mask = None
+
+            if task in self.new_task:
+                print(stdp_mask.mean())
+                self.new_task.remove(task)
+
+        for i in range(self.time_window):
+            if type(input) == list:
+                x = input[i]
+            else:
+                x = input > torch.rand(input.size()).cuda()
+                x = x.float()
+
+            x = x.view(batch_size, -1)
+
+            # if i == 0:
+            #     stdp_mask = stdp * stdp_his if stdp is not None else None
+
+            ori_current = spikinglinearExcitability(x, self.weight, excitability, self.bias, stdp_mask)
+            current = self.beta * torch.sigmoid(ori_current) - self.sigma
+            # print('current max:', torch.tanh(current).max().item())
+            # print('current mean:', torch.tanh(current).mean().item())
+            # print('current min:', torch.tanh(current).min().item())
+
+            if membrane_potential is None:
+                membrane_potential = torch.zeros((batch_size, self.out_features)).cuda() + current
+            else:
+                membrane_potential = membrane_potential * decay * (1 - spike) + current
+            # print('membrane_potential max:', membrane_potential.max().item())
+            # print('membrane_potential mean:', membrane_potential.mean().item())
+            # print('membrane_potential min:', membrane_potential.min().item())
+
+            spike = act_fun(membrane_potential)
+            # spike = act_fun(self.hook(membrane_potential, labels, None)) if not self.last_layer else act_fun(membrane_potential)
+            # spike = self.hook(act_fun(membrane_potential), labels, None) if not self.last_layer else act_fun(membrane_potential)
+
+            sum_x += x
+            sum_spike += spike
+            outputs.append(spike)
+
+            ##-- STDP Approach 1 --##
+
+            # with torch.no_grad():
+            #     stdp = torch.bmm(spike.unsqueeze(2), x.unsqueeze(1)).mean(dim=0)
+            #     stdp_mask = stdp_his * stdp if stdp_his is not None else stdp
+            #     # print(stdp_mask.mean())
+
+            #     stdp_ = 1 - stdp
+            #     if stdp_new is not None:
+            #         stdp_temp = torch.zeros_like(stdp_new)
+            #         stdp_temp[stdp_new > stdp_] = alpha * stdp_[stdp_new > stdp_] + (1 - alpha) * stdp_new[stdp_new > stdp_]
+            #         stdp_temp[stdp_ > stdp_new] = alpha * stdp_new[stdp_ > stdp_new] + (1 - alpha) * stdp_[stdp_ > stdp_new]
+            #         stdp_new = stdp_temp
+            #     else:
+            #         stdp_new = torch.ones_like(stdp_)
+
+            ##-- STDP Approach 2 --##
+
+            # if labels is not None:
+            #     with torch.no_grad():
+            #         stdp_all = torch.bmm(spike.unsqueeze(2), x.unsqueeze(1))
+            #         for label in range(min_label, max_label + 1):
+            #             index = (labels == label)
+            #             if len(index) != 0:
+            #                 stdp_label = stdp_all[index, :].mean(dim=0)
+            #                 stdp_old = self.stdp_list[label]
+            #                 stdp_temp = torch.zeros_like(stdp_old)
+            #                 stdp_delta = (stdp_old - stdp_temp).abs()
+
+            #                 print((stdp_delta > 0.5).sum() / (stdp_delta.shape[0] * stdp_delta.shape[1]))
+
+            #                 # print('stdp_delta max:', stdp_delta.max().item())
+            #                 # print('stdp_delta mean:', stdp_delta.mean().item())
+            #                 # print('stdp_delta min:', stdp_delta.min().item())
+
+            #                 stdp_temp = alpha * stdp_label + (1 - alpha) * stdp_old
+
+            #                 # if stdp_temp[stdp_label > 0.5].shape[0] > 0:
+            #                 #     stdp_temp[stdp_label > 0.5] = 1
+
+            #                 # if stdp_temp[stdp_old > stdp_label].shape[0] > 0:
+            #                 #     stdp_temp[stdp_old > stdp_label] = alpha * stdp_old[stdp_old > stdp_label] + (1 - alpha) * stdp_label[stdp_old > stdp_label]
+            #                 # if stdp_temp[stdp_label > stdp_old].shape[0] > 0:
+            #                 #     stdp_temp[stdp_label > stdp_old] = alpha * stdp_label[stdp_label > stdp_old] + (1 - alpha) * stdp_old[stdp_label > stdp_old]
+
+            #                 # print('stdp of label', label, 'max:', stdp_temp.max().item())
+            #                 # print('stdp of label', label, 'mean:', stdp_temp.mean().item())
+            #                 # print('stdp of label', label, 'min:', stdp_temp.min().item())
+
+            #                 self.stdp_list[label] = stdp_temp
+
+        ##-- STDP Approach 3 --##
+
+        # if labels is not None:
+        #     with torch.no_grad():
+        #         firerate_x = sum_x / self.time_window
+        #         firerate_spike = sum_spike / self.time_window
+        #         if self.last_layer:
+        #             firerate_spike_temp = torch.zeros_like(firerate_spike)
+        #             firerate_spike_temp[:, min_label:max_label + 1] = firerate_spike[:, min_label:max_label + 1]
+        #             firerate_spike = firerate_spike_temp
+        #         stdp_all = torch.bmm(firerate_spike.unsqueeze(2), firerate_x.unsqueeze(1))
+        #         for label in range(min_label, max_label + 1):
+        #             index = (labels == label)
+        #             if len(index) != 0:
+        #                 stdp_label = stdp_all[index, :].mean(dim=0)
+        #                 stdp_old = self.stdp_list[label]
+        #                 stdp_temp = torch.zeros_like(stdp_old)
+        #                 stdp_delta = (stdp_old - stdp_label).abs()
+        #                 # g = (stdp_delta > 0.05).sum() / (stdp_delta.shape[0] * stdp_delta.shape[1])
+        #                 g = stdp_delta.mean()
+        #                 if g < 0.01:
+        #                     print('stable:', g)
+        #                 else:
+        #                     print('unstable:', g)
+        #                 # print('stdp_delta max:', stdp_delta.max().item())
+        #                 # print('stdp_delta mean:', stdp_delta.mean().item())
+        #                 # print('stdp_delta min:', stdp_delta.min().item())
+
+        #                 stdp_temp = self.alpha * stdp_label + (1 - self.alpha) * stdp_old
+        #                 self.stdp_list[label] = stdp_temp
+
+        ##-- STDP Approach 4 --##
+
+        if labels is not None:
+            with torch.no_grad():
+                firerate_x = sum_x / self.time_window
+                firerate_spike = sum_spike / self.time_window
+                # if self.last_layer:
+                #     firerate_spike_temp = torch.ones_like(firerate_spike)
+                #     firerate_spike_temp[:, min_label:(max_label + 1)] = firerate_spike[:, min_label:(max_label + 1)]
+                #     if (max_label + 1 < self.out_features):
+                #         firerate_spike_temp[max_label + 1:] = 0
+                #     firerate_spike = firerate_spike_temp
+                stdp_all = torch.bmm(firerate_spike.unsqueeze(2), firerate_x.unsqueeze(1)).mean(dim=0)
+                stdp_old = self.stdp_list[int(min_label / 2)]
+                stdp_temp = torch.zeros_like(stdp_old)
+                # stdp_delta = (stdp_old - stdp_all).abs()
+                # g = (stdp_delta > 0.05).sum() / (stdp_delta.shape[0] * stdp_delta.shape[1])
+                # g = stdp_delta.mean()
+                # if g < 0.01:
+                #     print('stable:', g)
+                # else:
+                #     print('unstable:', g)
+                # print('stdp_delta max:', stdp_delta.max().item())
+                # print('stdp_delta mean:', stdp_delta.mean().item())
+                # print('stdp_delta min:', stdp_delta.min().item())
+
+                stdp_temp = self.alpha * stdp_all+ (1 - self.alpha) * stdp_old
+                self.stdp_list[int(min_label / 2)] = stdp_temp
+
+        if self.membrane_reserve:
+            self.membrane_potential = membrane_potential
+        # if self.stdp_reserve:
+        #     self.stdp = stdp
+        #     self.stdp_his = stdp_new
+
+        return outputs
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(' + 'in_features=' + str(self.in_features) + ', out_features=' + str(self.out_features) + ')'
